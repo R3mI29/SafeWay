@@ -1,11 +1,10 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <linux/limits.h>
 #include <unistd.h>
-#include <assert.h>
 #include <sys/inotify.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include "FileScan.h"
 
 char *GetPathDownload(){
@@ -28,14 +27,17 @@ char *GetPathDownload(){
 
 
 
+// Retourne 1 pour supprimer, 0 pour garder, -1 si on n'a pas pu avoir de reponse
 int AskUserPopup(const char *filename) {
+    // Une apostrophe dans le nom casserait la commande shell (injection possible).
+    // On ne supprime pas pour autant : on laisse le fichier verrouille.
     if (strchr(filename, '\'') != NULL) {
-        printf("[!] Alerte : Nom de fichier malveillant detecte (injection shell), suppression directe !\n");
-        return 1; 
+        printf("[!] Nom de fichier avec une apostrophe : popup impossible, le fichier reste verrouille.\n");
+        return -1;
     }
     char cmd[1024];
     snprintf(cmd, sizeof(cmd),
-             "zenity --question "
+             "zenity --question --no-markup "
              "--title='Alerte SafeWay' "
              "--text='Le fichier \"%s\" vient d etre bloque par SafeWay.\n\nVoulez-vous le supprimer definitivement ?' "
              "--ok-label='Supprimer' "
@@ -43,51 +45,104 @@ int AskUserPopup(const char *filename) {
              "--width=400 2>/dev/null",
              filename);
     int ret = system(cmd);
-    if (ret == 0) {
+
+    // zenity renvoie 0 si on clique sur "Supprimer", 1 si on clique sur "Garder".
+    // Tout autre cas (zenity pas installe, plante...) : on ne decide rien.
+    if (WIFEXITED(ret) && WEXITSTATUS(ret) == 0) {
         return 1; //Supprime
     }
-    return 0; //Garde
+    if (WIFEXITED(ret) && WEXITSTATUS(ret) == 1) {
+        return 0; //Garde
+    }
+    return -1;
 }
 
 
 
 void DownloadFileScan(){
     char * PathDownload = GetPathDownload();
+    if (PathDownload == NULL)
+    {
+        return;
+    }
     int test = chdir(PathDownload);
-
-    assert(test == 0);
+    if (test != 0)
+    {
+        printf("Erreur : impossible d'aller dans le dossier Telechargements\n");
+        free(PathDownload);
+        return;
+    }
 
     // On récupère le File Descriptor pour parler avec le noyau
     int fd = inotify_init();
+    if (fd < 0)
+    {
+        printf("Erreur : inotify_init a echoue\n");
+        free(PathDownload);
+        return;
+    }
 
     // On lui dit que on veut ou les fichiers et dossiers qui viennent de finir d'écrire (donc fin de téléchargement), ou ceux qui viennent de bouger ou renommé dans ce dossier
     test = inotify_add_watch(fd,PathDownload,(IN_CLOSE_WRITE | IN_MOVED_TO));
-    free(PathDownload);
+    free(PathDownload); // On libere ICI, apres le dernier endroit ou on s'en sert
+    if (test < 0)
+    {
+        printf("Erreur : inotify_add_watch a echoue\n");
+        return;
+    }
+
     char buffer[4096];
     while (1)
     {
-        ssize_t lenght = read(fd, buffer, sizeof(buffer));
-        if (lenght < 0)
+        ssize_t length = read(fd, buffer, sizeof(buffer));
+        if (length < 0)
         {
+            printf("Erreur de lecture\n");
+            break;
+        }
 
-        }
-        struct inotify_event *event = (struct inotify_event *)buffer;
-        chmod(event->name,0400); // On met 0400 et pas 0000 car on veutr le laisser en lecture seul, comme ça SafeWay peut le lire tranquille car le malware ne peut executer
-        int choice = AskUserPopup(event->name);
-        if (choice == 0)
+        // Un seul read() peut contenir plusieurs evenements les uns a la suite des autres.
+        // Chaque evenement fait sizeof(struct inotify_event) + event->len octets,
+        // donc on avance de cette taille pour arriver a l'evenement suivant.
+
+        // Passe 1 : on verrouille TOUS les fichiers recus avant de poser la moindre question
+        ssize_t i = 0;
+        while (i < length)
         {
-            if (IsExecutable(event->name))
+            struct inotify_event *event = (struct inotify_event *)(buffer + i);
+            if (!(event->mask & IN_ISDIR)) // On ignore les dossiers
             {
-                chmod(event->name,0755);
+                chmod(event->name,0400); // On met 0400 et pas 0000 car on veut le laisser en lecture seul, comme ça SafeWay peut le lire tranquille car le malware ne peut executer
             }
-            else
-            {
-                chmod(event->name, 0644);
-            }
+            i = i + sizeof(struct inotify_event) + event->len;
         }
-        else if (choice == 1)
+
+        // Passe 2 : on demande a l'utilisateur pour chaque fichier
+        i = 0;
+        while (i < length)
         {
-            remove(event->name);
+            struct inotify_event *event = (struct inotify_event *)(buffer + i);
+            if (!(event->mask & IN_ISDIR))
+            {
+                int choice = AskUserPopup(event->name);
+                if (choice == 0)
+                {
+                    if (IsExecutable(event->name))
+                    {
+                        chmod(event->name,0755);
+                    }
+                    else
+                    {
+                        chmod(event->name, 0644);
+                    }
+                }
+                else if (choice == 1)
+                {
+                    remove(event->name);
+                }
+                // Si choice vaut -1 on ne fait rien : le fichier reste en 0400
+            }
+            i = i + sizeof(struct inotify_event) + event->len;
         }
     }
 }
