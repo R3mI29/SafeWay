@@ -5,6 +5,7 @@
 #include <sys/inotify.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <dirent.h>
 #include <FileScan.h>
 #include <ExecutableReader.h>
 
@@ -29,7 +30,7 @@ char *GetPathDownload(){
 
 
 // Retourne 1 pour supprimer, 0 pour garder, -1 si on n'a pas pu avoir de reponse
-int AskUserPopup(const char *filename) {
+int AskUserPopup(char *filename) {
     // Une apostrophe dans le nom casserait la commande shell (injection possible).
     // On ne supprime pas pour autant : on laisse le fichier verrouille.
     if (strchr(filename, '\'') != NULL) {
@@ -59,34 +60,119 @@ int AskUserPopup(const char *filename) {
 }
 
 
+void HandleFile(char *filepath) {
+    int choice = AskUserPopup(filepath);
+    if (choice == 0) {
+        if (IsExecutable(filepath)) 
+        {
+            chmod(filepath, 0755);
+        } 
+        else 
+        {
+            chmod(filepath, 0644);
+        }
+    } 
+    else if (choice == 1) 
+    {
+        remove(filepath);
+    }
+}
 
-void DownloadFileScan(){
-    char * PathDownload = GetPathDownload();
-    if (PathDownload == NULL)
+
+
+void LockFolderRecursive(const char *folder_path) {
+    DIR *dir = opendir(folder_path);
+    if (dir == NULL) 
+    {
+        return;
+    }
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) 
+    {
+        if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0)
+        {
+            char full_path[4096];
+            snprintf(full_path, sizeof(full_path), "%s/%s", folder_path, entry->d_name);
+            struct stat st;
+            if (stat(full_path, &st) == 0) //On attribut à st les caractéristique de l'élément que l'on regarde actuelement 
+            {
+                if (S_ISDIR(st.st_mode)) // On demande avec une fonction native de <sys/stat.h> si c'est un dossier oou un fichier 
+                {
+                    LockFolderRecursive(full_path); // Sous-dossier : appel recursif
+                }
+                else 
+                {
+                    chmod(full_path, 0400); // Fichier : verrouillage immediat
+                }
+            }
+        }
+    }
+    closedir(dir);
+}
+
+
+void AskFolderRecursive(char *folder_path) {
+    DIR *dir = opendir(folder_path);
+    if (dir == NULL) {
+        return;
+    }
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) 
+    {
+        if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0)
+        {
+            char full_path[4096];
+            snprintf(full_path, sizeof(full_path), "%s/%s", folder_path, entry->d_name);
+            struct stat st;
+            if (stat(full_path, &st) == 0) //On attribut à st les caractéristique de l'élément que l'on regarde actuelement 
+            {
+                if (S_ISDIR(st.st_mode)) // On demande avec une fonction native de <sys/stat.h> si c'est un dossier oou un fichier 
+                {
+                    AskFolderRecursive(full_path);
+                }
+                else 
+                {
+                    HandleFile(full_path);
+                }
+            }
+        }
+    }
+    closedir(dir);
+}
+
+
+void DownloadFileScan_Folder(char *folder_path){
+    LockFolderRecursive(folder_path);
+    AskFolderRecursive(folder_path);
+}
+
+
+void DownloadFileScan() {
+    char *PathDownload = GetPathDownload();
+    if (PathDownload == NULL) 
     {
         return;
     }
     int test = chdir(PathDownload);
-    if (test != 0)
+    if (test != 0) 
     {
         printf("Erreur : impossible d'aller dans le dossier Telechargements\n");
         free(PathDownload);
         return;
     }
 
-    // On récupère le File Descriptor pour parler avec le noyau
     int fd = inotify_init();
-    if (fd < 0)
+    if (fd < 0) 
     {
         printf("Erreur : inotify_init a echoue\n");
         free(PathDownload);
         return;
     }
 
-    // On lui dit que on veut ou les fichiers et dossiers qui viennent de finir d'écrire (donc fin de téléchargement), ou ceux qui viennent de bouger ou renommé dans ce dossier
-    test = inotify_add_watch(fd,PathDownload,(IN_CLOSE_WRITE | IN_MOVED_TO));
-    free(PathDownload); // On libere ICI, apres le dernier endroit ou on s'en sert
-    if (test < 0)
+    test = inotify_add_watch(fd, PathDownload, (IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE));
+    free(PathDownload); // Plus besoin de la chaine PathDownload en memoire
+    if (test < 0) 
     {
         printf("Erreur : inotify_add_watch a echoue\n");
         close(fd);
@@ -94,55 +180,56 @@ void DownloadFileScan(){
     }
 
     char buffer[4096];
-    while (1)
+    while (1) 
     {
+
+
         ssize_t length = read(fd, buffer, sizeof(buffer));
-        if (length < 0)
+        if (length < 0) 
         {
             printf("Erreur de lecture\n");
             break;
         }
 
-        // Un seul read() peut contenir plusieurs evenements les uns a la suite des autres.
-        // Chaque evenement fait sizeof(struct inotify_event) + event->len octets,
-        // donc on avance de cette taille pour arriver a l'evenement suivant.
 
-        // Passe 1 : on verrouille TOUS les fichiers recus avant de poser la moindre question
+        // Passe 1 : on verrouille TOUS les fichiers et contenus de dossiers recus avant d'ouvrir le moindre pop-up
         ssize_t i = 0;
-        while (i < length)
+        while (i < length) 
         {
             struct inotify_event *event = (struct inotify_event *)(buffer + i);
-            if (!(event->mask & IN_ISDIR) && event->len > 0) // On ignore les dossiers
+            if (event->len > 0) 
             {
-                chmod(event->name,0400); // On met 0400 et pas 0000 car on veut le laisser en lecture seul, comme ça SafeWay peut le lire tranquille car le malware ne peut executer
+                if (event->mask & IN_ISDIR) 
+                {
+                    // C'est un dossier : on verrouille recursivement tous les fichiers qu'il contient
+                    LockFolderRecursive(event->name);
+                } 
+                else if (event->mask & (IN_CLOSE_WRITE | IN_MOVED_TO)) 
+                {
+                    // C'est un fichier qui vient de finir d'etre ecrit ou d'etre deplace
+                    chmod(event->name, 0400);
+                }
             }
             i = i + sizeof(struct inotify_event) + event->len;
         }
 
-        // Passe 2 : on demande a l'utilisateur pour chaque fichier
+
+
+        // Passe 2 : on demande a l'utilisateur pour chaque fichier ou contenu de dossier
         i = 0;
-        while (i < length)
+        while (i < length) 
         {
             struct inotify_event *event = (struct inotify_event *)(buffer + i);
-            if (!(event->mask & IN_ISDIR))
+            if (event->len > 0) 
             {
-                int choice = AskUserPopup(event->name);
-                if (choice == 0)
+                if (event->mask & IN_ISDIR) 
                 {
-                    if (IsExecutable(event->name))
-                    {
-                        chmod(event->name,0755);
-                    }
-                    else
-                    {
-                        chmod(event->name, 0644);
-                    }
-                }
-                else if (choice == 1)
+                    AskFolderRecursive(event->name);
+                } 
+                else if (event->mask & (IN_CLOSE_WRITE | IN_MOVED_TO)) 
                 {
-                    remove(event->name);
+                    HandleFile(event->name);
                 }
-                // Si choice vaut -1 on ne fait rien : le fichier reste en 0400
             }
             i = i + sizeof(struct inotify_event) + event->len;
         }
