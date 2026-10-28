@@ -5,7 +5,8 @@
 #include <sys/inotify.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
-#include "FileScan.h"
+#include <FileScan.h>
+#include <ExecutableReader.h>
 
 char *GetPathDownload(){
     char *home = getenv("HOME");
@@ -88,6 +89,7 @@ void DownloadFileScan(){
     if (test < 0)
     {
         printf("Erreur : inotify_add_watch a echoue\n");
+        close(fd);
         return;
     }
 
@@ -110,7 +112,7 @@ void DownloadFileScan(){
         while (i < length)
         {
             struct inotify_event *event = (struct inotify_event *)(buffer + i);
-            if (!(event->mask & IN_ISDIR)) // On ignore les dossiers
+            if (!(event->mask & IN_ISDIR) && event->len > 0) // On ignore les dossiers
             {
                 chmod(event->name,0400); // On met 0400 et pas 0000 car on veut le laisser en lecture seul, comme ça SafeWay peut le lire tranquille car le malware ne peut executer
             }
@@ -145,4 +147,5 @@ void DownloadFileScan(){
             i = i + sizeof(struct inotify_event) + event->len;
         }
     }
+    close(fd);
 }

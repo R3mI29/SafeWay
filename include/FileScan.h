@@ -1,5 +1,5 @@
-#ifndef TOWERDEFEND_H_INCLUDED
-#define TOWERDEFEND_H_INCLUDED
+#ifndef FILESCAN_H_INCLUDED
+#define FILESCAN_H_INCLUDED
 
 
 void DownloadFileScan();
