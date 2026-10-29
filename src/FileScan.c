@@ -61,20 +61,23 @@ int AskUserPopup(char *filename) {
 
 
 void HandleFile(char *filepath) {
-    int choice = AskUserPopup(filepath);
-    if (choice == 0) {
-        if (IsExecutable(filepath)) 
-        {
-            chmod(filepath, 0755);
-        } 
-        else 
-        {
-            chmod(filepath, 0644);
-        }
-    } 
-    else if (choice == 1) 
+    if (Grade(filepath) >= 60)
     {
-        remove(filepath);
+        int choice = AskUserPopup(filepath);
+        if (choice == 0) {
+            if (IsExecutable(filepath)) 
+            {
+                chmod(filepath, 0755);
+            } 
+            else 
+            {
+                chmod(filepath, 0644);
+            }
+        } 
+        else if (choice == 1) 
+        {
+            remove(filepath);
+        }
     }
 }
 
